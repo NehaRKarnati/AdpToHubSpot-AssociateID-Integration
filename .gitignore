@@ -1,0 +1,8 @@
+node_modules/
+.env
+certs/
+tokens/
+logs/
+*.log
+reports/
+exportOtherWorksites.js
