@@ -7,10 +7,24 @@ const { logger } = require('./logger');
 
 const LEGACY_LABEL_SUFFIX = ' (legacy)';
 
+// Placeholder option values that are never real people and should never be
+// touched by migration/cleanup - no name match will ever exist for these, and
+// they should stay exactly as-is (visible, not renamed/hidden/deleted)
+// regardless of usage.
+const PROTECTED_OPTION_VALUES = new Set(['Vacant']);
+
 // One pause before the "is it still in use" pass, not per-record retries -
 // HubSpot's search index is eventually consistent, so give it a moment to
 // catch up with every reassignment PATCHed in phase 1 before phase 2 trusts it.
 const SEARCH_INDEX_SETTLE_MS = 10000;
+
+// Short pause after creating the new associateId-keyed options (property
+// PATCH) before attempting any company reassignment onto them - a defensive
+// buffer in case HubSpot's property-definition validation doesn't see a
+// just-written option as immediately valid. Much shorter than
+// SEARCH_INDEX_SETTLE_MS since this isn't waiting on the search index, just
+// the property definition itself.
+const OPTION_CREATE_SETTLE_MS = 3000;
 
 /*
     ONE-TIME migration - not part of the recurring sync (syncOrchestrator.js).
@@ -28,14 +42,21 @@ const SEARCH_INDEX_SETTLE_MS = 10000;
 
     Per list:
 
-    Phase 1 - for every legacy option that matches a current ADP record:
-    create/confirm the correct associateId-keyed option (clean label,
-    hidden: false), then reassign every company currently on that legacy
-    value over to the new associateId-keyed value (writing the paired ID
-    field too, if this list has one). Legacy options with no ADP match are
-    left alone here - there's no correct value to reassign their companies to.
+    Phase 1a - for every legacy option that matches a current ADP record,
+    build the correct associateId-keyed option (clean label, hidden: false)
+    IN MEMORY, then PATCH the property once with all of them added. This has
+    to happen and be written to HubSpot BEFORE any company reassignment is
+    attempted - HubSpot rejects (400) a company PATCH that sets an enum
+    property to a value not already among that property's defined options,
+    and the new associateId value obviously isn't yet until this PATCH lands.
 
-    Phase 2 - only after every phase-1 write for this list is done (and a
+    Phase 1b - now that the new options actually exist on the property,
+    reassign every company currently on each matched legacy value over to the
+    new associateId-keyed value (writing the paired ID field too, if this
+    list has one). Legacy options with no ADP match are left alone here -
+    there's no correct value to reassign their companies to.
+
+    Phase 2 - only after every phase-1b write for this list is done (and a
     short settle delay), batch-check (getValuesInUse) whether each legacy
     value is now truly unreferenced anywhere in the portal. If so, delete the
     option outright. If something still holds it - an unmatched legacy option,
@@ -45,7 +66,7 @@ const SEARCH_INDEX_SETTLE_MS = 10000;
 
     Pass dryRun: true to compute and log every decision (option creates,
     company reassignments, deletes/hides) exactly as normal, but skip every
-    actual write - the company PATCHes and both property PATCHes.
+    actual write - both property PATCHes and every company PATCH.
 
     multiSelect lists (ados_in_20_min_drive) store a semicolon-delimited list
     of values - reassignment there uses CONTAINS_TOKEN search + a token
@@ -63,7 +84,7 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
 
     const property = await getCompanyProperty(listName);
     const allOptions = property.options || [];
-    const legacyOptions = allOptions.filter(opt => !knownAssociateIds.has(opt.value));
+    const legacyOptions = allOptions.filter(opt => !knownAssociateIds.has(opt.value) && !PROTECTED_OPTION_VALUES.has(opt.value));
 
     logger.info('Found legacy options for list', { list: listName, count: legacyOptions.length });
     if (legacyOptions.length === 0) return { results: [], finalOptions: allOptions };
@@ -71,9 +92,11 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
     const results = [];
     const optionsByValue = new Map(allOptions.map(opt => [opt.value, opt]));
     const pendingCleanup = []; // { legacyValue, label, cleanLabel, newAssociateId }
+    const matchedOptions = []; // legacy options with an ADP match - need company reassignment in phase 1b
 
-    // Phase 1: create/confirm the correct option, then reassign companies
-    // off the legacy value, for each legacy option that has an ADP match.
+    // Phase 1a: figure out which legacy options match a current ADP record,
+    // and build the new associateId-keyed option for each - in memory only,
+    // no company reassignment yet.
     for (const option of legacyOptions) {
         const cleanLabel = option.label.endsWith(LEGACY_LABEL_SUFFIX)
             ? option.label.slice(0, -LEGACY_LABEL_SUFFIX.length)
@@ -88,6 +111,14 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
             continue;
         }
 
+        // Must happen before setting the new option below: the legacy option
+        // being replaced almost always has this exact label already (that's
+        // how the name match worked in the first place) - without renaming
+        // it out of the way here, the upcoming early PATCH would send two
+        // options with the same label in one request and HubSpot would
+        // reject the whole PATCH (NON_UNIQUE_OPTION_LABELS).
+        resolveLabelCollision(optionsByValue, cleanLabel, newAssociateId);
+
         optionsByValue.set(newAssociateId, {
             ...optionsByValue.get(newAssociateId),
             label: cleanLabel,
@@ -95,7 +126,37 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
             hidden: false
         });
         results.push({ list: listName, legacyValue: option.value, label: option.label, newAssociateId, action: 'option_created' });
+        matchedOptions.push({ option, cleanLabel, newAssociateId });
+    }
 
+    // Write the new options to HubSpot NOW, before any company reassignment
+    // is attempted against them - see the phase 1a/1b split explained above.
+    if (matchedOptions.length > 0) {
+        if (dryRun) {
+            logger.info(`${tag}Would create new associateId-keyed options before reassigning companies - no write performed`, {
+                dropdown: listName, optionsToCreate: matchedOptions.length
+            });
+        } else {
+            try {
+                await hubspotClient.patch(`/crm/v3/properties/companies/${listName}`, {
+                    options: Array.from(optionsByValue.values())
+                });
+                logger.info('Created new associateId-keyed options ahead of company reassignment', {
+                    dropdown: listName, optionsCreated: matchedOptions.length
+                });
+                await new Promise(resolve => setTimeout(resolve, OPTION_CREATE_SETTLE_MS));
+            } catch (error) {
+                logger.error('Failed to create new options before reassignment - aborting reassignment for this list', {
+                    dropdown: listName, error: error.message
+                });
+                throw error;
+            }
+        }
+    }
+
+    // Phase 1b: now that the new options are real (or this is a dry run),
+    // reassign companies off each matched legacy value.
+    for (const { option, cleanLabel, newAssociateId } of matchedOptions) {
         let companies;
         try {
             companies = multiSelect
@@ -266,7 +327,7 @@ async function cleanupLegacyOptionsForList(listName, listRecords, multiSelect, d
 
     const property = await getCompanyProperty(listName);
     const allOptions = property.options || [];
-    const legacyOptions = allOptions.filter(opt => !knownAssociateIds.has(opt.value));
+    const legacyOptions = allOptions.filter(opt => !knownAssociateIds.has(opt.value) && !PROTECTED_OPTION_VALUES.has(opt.value));
 
     if (legacyOptions.length === 0) return [];
 

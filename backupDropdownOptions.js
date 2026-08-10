@@ -5,15 +5,17 @@ const { rowsToCsv } = require('./csvUtils');
 const { LIST_DEFINITIONS } = require('./config');
 const { logger } = require('./logger');
 
-const OUTPUT_PATH = path.join(__dirname, 'reports', 'dropdownOptionsBackup.csv');
-
 /*
     Pulls every current option (label, value, hidden, displayOrder) from all
-    13 dropdown properties, live from HubSpot - a full pre-migration snapshot
-    so there's something to restore from/compare against if anything needs to
-    be rolled back. Read-only, no writes.
+    13 dropdown properties, live from HubSpot - a full snapshot so there's
+    something to restore from/compare against if anything needs to be rolled
+    back. Read-only, no writes.
+
+    Pass a filename suffix (node backupDropdownOptions.js after) to write a
+    distinctly-named file instead of overwriting the default - e.g. keeping a
+    before/after pair around the same migration.
 */
-async function backupDropdownOptions() {
+async function backupDropdownOptions(outputPath) {
     const rows = [];
 
     for (const listName of Object.keys(LIST_DEFINITIONS)) {
@@ -32,14 +34,18 @@ async function backupDropdownOptions() {
         }
     }
 
-    fs.mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
-    fs.writeFileSync(OUTPUT_PATH, rowsToCsv(rows));
-    logger.info('Wrote dropdown options backup', { rows: rows.length, outputPath: OUTPUT_PATH });
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, rowsToCsv(rows));
+    logger.info('Wrote dropdown options backup', { rows: rows.length, outputPath });
     return rows;
 }
 
 if (require.main === module) {
-    backupDropdownOptions().catch(error => {
+    const suffix = process.argv[2];
+    const fileName = suffix ? `dropdownOptionsBackup_${suffix}.csv` : 'dropdownOptionsBackup.csv';
+    const outputPath = path.join(__dirname, 'reports', fileName);
+
+    backupDropdownOptions(outputPath).catch(error => {
         logger.error('Error backing up dropdown options', { error: error.message });
         process.exitCode = 1;
     });

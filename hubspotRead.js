@@ -76,11 +76,16 @@ hubspotClient.interceptors.response.use(
     }
 );
 
-// Every real, live customer location should be touched by this integration -
-// applied to every company search so ard doesn't get read/written on
-// prospect/lead records. No longer requires clinic_id to be set (some
-// customer locations don't have one) - lifecyclestage alone defines scope now.
+// Only real, live clinic companies should ever be touched by this integration -
+// applied to every company search so ard doesn't get read/written on non-clinic
+// or prospect/lead records. REVERTED (2026-08-07): removing clinic_id earlier
+// today caused lifecyclestage: customer alone to match thousands of unrelated
+// companies (other senior living brands/competitors, likely customers of a
+// different EmpowerMe business line) - confirmed live during dvp migration,
+// which tried to reassign 527 companies to one DVP, most of them clearly not
+// real EmpowerMe clinic locations. clinic_id HAS_PROPERTY is required again.
 const BASE_COMPANY_FILTERS = [
+    { propertyName: 'clinic_id', operator: 'HAS_PROPERTY' },
     { propertyName: 'lifecyclestage', operator: 'EQ', value: 'customer' }
 ];
 
@@ -116,8 +121,12 @@ async function getOptionsByAssociateId(propertyName) {
     Finds every company currently assigned to a given associate ID via the
     dropdown property - no name matching involved, since the dropdown's
     internal value already is the associate ID.
+
+    extraProperties: additional property names to pull back alongside name/
+    propertyName - e.g. the paired ID field, so a caller can check whether
+    that field is already correct before deciding to PATCH at all.
 */
-async function getCompaniesByPropertyValue(propertyName, associateId) {
+async function getCompaniesByPropertyValue(propertyName, associateId, extraProperties = []) {
     const companies = [];
     let after = undefined;
 
@@ -127,7 +136,7 @@ async function getCompaniesByPropertyValue(propertyName, associateId) {
                 filterGroups: [{
                     filters: [...BASE_COMPANY_FILTERS, { propertyName, operator: 'EQ', value: associateId }]
                 }],
-                properties: ['name', propertyName],
+                properties: ['name', propertyName, ...extraProperties],
                 limit: 100,
                 after
             });

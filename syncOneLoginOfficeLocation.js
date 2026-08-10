@@ -146,18 +146,35 @@ function buildOfficeLocationValue(homeClinicId, hubspotClinicIds) {
 
 
 /*
-    Finds the OneLogin user matching this ADO's work email. Returns null if no
-    match is found (rather than throwing), so the caller can log and skip.
+    Finds the OneLogin user matching this ADO's ADP associate ID, via the
+    "ADP ID [AQUERA]" custom attribute (shortname: adpid) - confirmed to hold
+    the same value as ADP's workerID.idValue, and confirmed filterable
+    directly via OneLogin's Users API (custom_attributes.adpid query param).
+    More reliable than matching by email (no typo/alias/rename risk).
+
+    IMPORTANT: the custom_attributes.adpid-filtered list response only
+    includes a stripped-down user object (just email/id, no custom_attributes
+    at all) - confirmed empirically. So once a match is found by ID, this
+    does a second GET for that specific user to get the FULL record
+    (including current custom_attributes.officelocation) - without this,
+    "current value" would always read back as empty/undefined regardless of
+    what's actually set.
+
+    Returns null if no match is found (rather than throwing), so the caller
+    can log and skip.
 */
-async function findOneLoginUserByEmail(email) {
+async function findOneLoginUserByAssociateId(associateId) {
     try {
         const response = await oneLoginClient.get('/api/2/users', {
-            params: { email }
+            params: { 'custom_attributes.adpid': associateId }
         });
         const users = response.data;
-        return (users && users.length > 0) ? users[0] : null;
+        if (!users || users.length === 0) return null;
+
+        const fullUser = await oneLoginClient.get(`/api/2/users/${users[0].id}`);
+        return fullUser.data;
     } catch (error) {
-        logger.error('Failed to look up OneLogin user by email', { email, error: error.message });
+        logger.error('Failed to look up OneLogin user by associate ID', { associateId, error: error.message });
         throw error;
     }
 }
@@ -230,10 +247,10 @@ async function run({ dryRun = true } = {}) {
         const hubspotClinicIds = clinicIdsByAdoId.get(ado.associateId) || [];
         const officeLocationValue = buildOfficeLocationValue(ado.homeClinicId, hubspotClinicIds);
 
-        const oneLoginUser = await findOneLoginUserByEmail(ado.email);
+        const oneLoginUser = await findOneLoginUserByAssociateId(ado.associateId);
         if (!oneLoginUser) {
             logger.warn('No matching OneLogin user found for ADO', { associateId: ado.associateId, email: ado.email });
-            skippedNoUser.push({ fullName: ado.fullName, email: ado.email });
+            skippedNoUser.push({ fullName: ado.fullName, email: ado.email, associateId: ado.associateId });
             continue;
         }
 
@@ -296,28 +313,28 @@ async function generateValidationReport() {
 }
 
 /*
-    CLI entry point - defaults to the safe, read-only validation report
-    (matches every other report script in this project). Pass "live" to
-    actually run the sync for real (node syncOneLoginOfficeLocation.js live),
-    or "dry" to run the exact same logic/logging as a live run but through
-    patchOfficeLocationDryRun instead of a real PATCH.
+    CLI entry point - REAL RUN by default (node syncOneLoginOfficeLocation.js),
+    same pattern as main.js, since this is the file meant to be scheduled by
+    cron. Pass "dry" to run the exact same logic/logging but through
+    patchOfficeLocationDryRun instead of a real PATCH, or "report" for the
+    read-only validation CSV instead of touching OneLogin at all.
 */
 if (require.main === module) {
     const mode = process.argv[2];
 
-    if (mode === 'live') {
-        run({ dryRun: false }).catch(error => {
-            logger.error('Error running ADO office location sync', { error: error.message });
-            process.exitCode = 1;
-        });
-    } else if (mode === 'dry') {
+    if (mode === 'dry') {
         run({ dryRun: true }).catch(error => {
             logger.error('Error running ADO office location sync (dry run)', { error: error.message });
             process.exitCode = 1;
         });
-    } else {
+    } else if (mode === 'report') {
         generateValidationReport().catch(error => {
             logger.error('Error generating ADO office location validation report', { error: error.message });
+            process.exitCode = 1;
+        });
+    } else {
+        run({ dryRun: false }).catch(error => {
+            logger.error('Error running ADO office location sync', { error: error.message });
             process.exitCode = 1;
         });
     }
@@ -330,7 +347,7 @@ module.exports = {
     getActiveAdos,
     buildHubspotClinicIdsByAdoId,
     buildOfficeLocationValue,
-    findOneLoginUserByEmail,
+    findOneLoginUserByAssociateId,
     patchOfficeLocationDryRun,
     patchOfficeLocation,
     generateValidationReport

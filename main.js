@@ -1,12 +1,12 @@
 const { runSync } = require('./syncOrchestrator');
-const { cleanupLegacyOptions } = require('./migrateLegacyOptions');
+const { migrateLegacyOptions } = require('./migrateLegacyOptions');
 const { logger } = require('./logger');
 
-// Gap between sync and cleanup - lets HubSpot's search index settle on
+// Gap between sync and migration - lets HubSpot's search index settle on
 // everything sync just wrote, so migration's usage checks (which decide
 // delete vs. hide for leftover legacy options) read accurate, caught-up data
 // rather than racing the writes that just happened.
-const CLEANUP_DELAY_MS = 2 * 60 * 1000;
+const MIGRATION_DELAY_MS = 2 * 60 * 1000;
 
 /*
     Entry point for a single scheduled run. Scheduling (cron) is handled on
@@ -16,13 +16,15 @@ const CLEANUP_DELAY_MS = 2 * 60 * 1000;
       1. runSync() - the everyday reconciliation (option create/update/hide/
          delete for active/terminated ADP people, company field refresh).
          This never touches legacy name-valued options at all.
-      2. cleanupLegacyOptions() - the lightweight recheck: for whatever
-         legacy options are already left over (from a prior manual
-         migrateLegacyOptions run), checks if anything still references them
-         and deletes if not, else leaves them hidden+renamed. No name
-         matching, no option creation, no company reassignment here - that
-         heavier work only needs to happen once (or on demand) via
-         migrateLegacyOptions(), not every single scheduled run.
+      2. migrateLegacyOptions() - runs every day (not just once/on-demand) so
+         anyone who just became newly eligible for a list (e.g. promoted to
+         ADO) automatically gets matched by name and has their still-legacy-
+         valued companies reassigned - without this, someone whose HubSpot
+         option is still name-keyed would sit there forever, since runSync's
+         company-reassignment step only searches by associateId, never by
+         the old name string. Safe to run every day - it's a no-op for any
+         list with zero legacy options left (the common case once fully
+         migrated), and idempotent otherwise.
 */
 async function main() {
     try {
@@ -33,10 +35,10 @@ async function main() {
         const syncSummary = await runSync(99999, { dryRun: false });
         logger.info('Sync run complete', syncSummary);
 
-        await new Promise(resolve => setTimeout(resolve, CLEANUP_DELAY_MS));
+        await new Promise(resolve => setTimeout(resolve, MIGRATION_DELAY_MS));
 
-        const cleanupResults = await cleanupLegacyOptions();
-        logger.info('Legacy option cleanup complete', { actionCount: cleanupResults.length });
+        const migrationResults = await migrateLegacyOptions(99999, { dryRun: false });
+        logger.info('Legacy option migration/cleanup complete', { actionCount: migrationResults.length });
 
         process.exitCode = 0;
     } catch (error) {

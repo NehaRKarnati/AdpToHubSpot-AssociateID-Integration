@@ -34,7 +34,12 @@ async function syncList(listName, listRecords, associateIdField, multiSelect, dr
     for (const record of listRecords.active) {
         let companies;
         try {
-            companies = await getCompaniesByPropertyValue(listName, record.associateId);
+            // Also pull the paired ID field (if this list has one) so we can
+            // check below whether it's already correct - the dropdown value
+            // itself is guaranteed correct already (that's literally the
+            // search filter), so the ID field is the only thing that could
+            // still need a PATCH.
+            companies = await getCompaniesByPropertyValue(listName, record.associateId, associateIdField ? [associateIdField] : []);
         } catch (error) {
             runStats.increment('errors');
             runStats.addRecord({ ...record, list: listName, companyUpdateResult: 'search_failed', error: error.message });
@@ -56,6 +61,20 @@ async function syncList(listName, listRecords, associateIdField, multiSelect, dr
         }
 
         for (const company of companies) {
+            // Skip the PATCH entirely if there's nothing to fix - no ID field
+            // on this list, or the ID field already matches. Avoids a
+            // redundant re-write (and its 500ms throttle cost) for every
+            // company that's already correct, which after a migration run is
+            // the vast majority of them.
+            const idFieldAlreadyCorrect = !associateIdField || company.properties[associateIdField] === record.associateId;
+            if (idFieldAlreadyCorrect) {
+                // Not in RunStats's initial counts object, but increment()
+                // creates any missing key on first use - no logger.js change needed.
+                runStats.increment('companiesUnchanged');
+                runStats.addRecord({ ...record, list: listName, companyId: company.id, companyUpdateResult: 'unchanged' });
+                continue;
+            }
+
             try {
                 await updateCompanyAdoFields(company.id, record.associateId, listName, associateIdField, dryRun);
                 runStats.addRecord({ ...record, list: listName, companyId: company.id, companyUpdateResult: dryRun ? 'would_update' : 'updated' });
