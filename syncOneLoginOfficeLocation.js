@@ -74,12 +74,14 @@ async function getAdpWorkers({ forceRefresh = false } = {}) {
 }
 
 /*
-    Pulls every ADO (active + on-leave, terminated ignored) from ADP, keyed by
-    associateId, with their work email and home clinic ID.
+    Pure filter over an already-fetched worker list - factored out so
+    getPeopleToSync/generateValidationReport can fetch ADP data ONCE and
+    derive both ADOs and Care Coordinators from it, instead of each of
+    getActiveAdos/getAllActiveCareCoordinators independently calling
+    getAdpWorkers (which, with forceRefresh: true, means a full fresh ADP
+    pull happening twice in the same run).
 */
-async function getActiveAdos({ forceRefresh = false } = {}) {
-    const workers = await getAdpWorkers({ forceRefresh });
-
+function extractActiveAdos(workers) {
     const ados = [];
     for (const worker of workers) {
         if (isTestEmployee(worker)) continue;
@@ -102,6 +104,109 @@ async function getActiveAdos({ forceRefresh = false } = {}) {
         ados.push({ associateId, email, fullName, homeClinicId });
     }
     return ados;
+}
+
+/*
+    Pulls every ADO (active + on-leave, terminated ignored) from ADP, keyed by
+    associateId, with their work email and home clinic ID. Thin wrapper
+    around extractActiveAdos for standalone callers - getPeopleToSync/
+    generateValidationReport fetch workers themselves and call
+    extractActiveAdos directly instead, to avoid a duplicate ADP pull.
+*/
+async function getActiveAdos({ forceRefresh = false } = {}) {
+    const workers = await getAdpWorkers({ forceRefresh });
+    return extractActiveAdos(workers);
+}
+
+/*
+    ADP's primary work assignment carries a "reportsTo" array naming the
+    direct manager - per the user, everyone has exactly one entry, so this
+    just takes the first one rather than handling multiple managers.
+*/
+function extractManagerAssociateId(assignment) {
+    const reportsTo = assignment.reportsTo;
+    return (reportsTo && reportsTo[0] && reportsTo[0].workerID && reportsTo[0].workerID.idValue) || null;
+}
+
+/*
+    Manager's display name for a Care Coordinator - prefers looking their
+    associateId up among the same worker pool (gives the "First Last" format
+    used everywhere else in this project), falling back to ADP's own
+    reportsToWorkerName.formattedName ("Last, First") if the manager isn't in
+    that pool for some reason (e.g. a manager who isn't active/on-leave).
+*/
+function getManagerFullName(assignment, fullNameByAssociateId, managerAssociateId) {
+    if (managerAssociateId && fullNameByAssociateId.has(managerAssociateId)) {
+        return fullNameByAssociateId.get(managerAssociateId);
+    }
+    const reportsTo = assignment.reportsTo;
+    return (reportsTo && reportsTo[0] && reportsTo[0].reportsToWorkerName && reportsTo[0].reportsToWorkerName.formattedName) || null;
+}
+
+/*
+    Pure filter over an already-fetched worker list - same reasoning as
+    extractActiveAdos above. Finds EVERY active/on-leave Care Coordinator
+    (job code CARECOOR), regardless of who they report to.
+*/
+function extractAllActiveCareCoordinators(workers) {
+    const fullNameByAssociateId = new Map();
+    for (const worker of workers) {
+        const id = extractAssociateId(worker);
+        const name = extractFullName(worker);
+        if (id && name) fullNameByAssociateId.set(id, name);
+    }
+
+    const careCoordinators = [];
+    for (const worker of workers) {
+        if (isTestEmployee(worker)) continue;
+
+        const assignment = getPrimaryWorkAssignment(worker);
+        if (!assignment) continue;
+
+        const jobCode = assignment.jobCode && assignment.jobCode.codeValue;
+        if (classifyJobTitle(jobCode) !== 'carecoord') continue;
+
+        const associateId = extractAssociateId(worker);
+        const email = getWorkEmail(worker);
+        const fullName = extractFullName(worker);
+        const homeClinicId = getHomeClinicId(assignment);
+        const managerAssociateId = extractManagerAssociateId(assignment);
+        const managerFullName = getManagerFullName(assignment, fullNameByAssociateId, managerAssociateId);
+        if (!associateId || !email) {
+            logger.warn('Skipping Care Coordinator missing associateId or work email', { associateId, email });
+            continue;
+        }
+
+        careCoordinators.push({ associateId, email, fullName, homeClinicId, managerAssociateId, managerFullName });
+    }
+    return careCoordinators;
+}
+
+/*
+    Pulls EVERY active/on-leave Care Coordinator (job code CARECOOR),
+    regardless of who they report to - used for the validation report, so a
+    reviewer can see every Care Coordinator's manager and whether that
+    manager is currently an ADO (i.e., whether they'd actually get synced by
+    run()), not just the ones that already qualify. Thin wrapper around
+    extractAllActiveCareCoordinators - getPeopleToSync/generateValidationReport
+    fetch workers themselves and call the extract function directly instead,
+    to avoid a duplicate ADP pull.
+*/
+async function getAllActiveCareCoordinators({ forceRefresh = false } = {}) {
+    const workers = await getAdpWorkers({ forceRefresh });
+    return extractAllActiveCareCoordinators(workers);
+}
+
+/*
+    Pulls only the subset of getAllActiveCareCoordinators whose direct manager
+    is currently an active ADO - everyone else is left completely untouched
+    by this script, per the requirement that only Care Coordinators reporting
+    to an ADO get their office location synced. This is what run() actually
+    uses. adoAssociateIds: Set of active ADO associate IDs (see getActiveAdos).
+*/
+async function getActiveCareCoordinatorsReportingToAdo(adoAssociateIds, { forceRefresh = false } = {}) {
+    const allCareCoordinators = await getAllActiveCareCoordinators({ forceRefresh });
+    return allCareCoordinators.filter(cc => cc.managerAssociateId && adoAssociateIds.has(cc.managerAssociateId));
 }
 
 /*
@@ -134,14 +239,64 @@ async function buildHubspotClinicIdsByAdoId({ forceRefresh = false } = {}) {
 }
 
 /*
-    Combines the ADO's own home clinic ID with the clinic IDs of every
-    HubSpot company assigned to them, deduped, as a comma-separated string.
+    Combines a person's own home clinic ID with a set of HubSpot clinic IDs,
+    deduped, as a comma-separated string. Used both for an ADO (their own
+    home + their own HubSpot 'ard' companies) and for a Care Coordinator who
+    reports to an ADO (their own home + THAT ADO's HubSpot 'ard' companies).
 */
 function buildOfficeLocationValue(homeClinicId, hubspotClinicIds) {
     const combined = new Set();
     if (homeClinicId) combined.add(homeClinicId);
     for (const clinicId of hubspotClinicIds) combined.add(clinicId);
     return Array.from(combined).join(',');
+}
+
+/*
+    Builds the full list of people this script syncs office locations for:
+    every active/on-leave ADO (their own home + own HubSpot clinics), plus
+    every active/on-leave Care Coordinator reporting to one of those ADOs
+    (their own home + their MANAGER's HubSpot clinics, not the manager's home
+    location). Care Coordinators not reporting to an ADO are never included.
+
+    forceRefresh defaults to true - this script always wants current ADP AND
+    HubSpot data (same reasoning as syncOrchestrator.js's runSync forcing a
+    fresh ADP pull): a stale HubSpot cache is exactly what caused a Care
+    Coordinator to inherit a clinic their manager no longer owns (see A252/
+    Piatt County Nursing Home incident - clinic_id had been reassigned to a
+    different ADO within the 6hr cache window).
+*/
+async function getPeopleToSync({ forceRefresh = true } = {}) {
+    // One ADP pull, shared - see extractActiveAdos/extractAllActiveCareCoordinators.
+    const workers = await getAdpWorkers({ forceRefresh });
+    const ados = extractActiveAdos(workers);
+    const clinicIdsByAdoId = await buildHubspotClinicIdsByAdoId({ forceRefresh });
+    const adoAssociateIds = new Set(ados.map(a => a.associateId));
+
+    const careCoordinators = extractAllActiveCareCoordinators(workers)
+        .filter(cc => cc.managerAssociateId && adoAssociateIds.has(cc.managerAssociateId));
+
+    const people = [];
+    for (const ado of ados) {
+        people.push({
+            associateId: ado.associateId,
+            email: ado.email,
+            fullName: ado.fullName,
+            role: 'ado',
+            hubspotClinicIds: clinicIdsByAdoId.get(ado.associateId) || [],
+            homeClinicId: ado.homeClinicId
+        });
+    }
+    for (const cc of careCoordinators) {
+        people.push({
+            associateId: cc.associateId,
+            email: cc.email,
+            fullName: cc.fullName,
+            role: 'carecoord',
+            hubspotClinicIds: clinicIdsByAdoId.get(cc.managerAssociateId) || [],
+            homeClinicId: cc.homeClinicId
+        });
+    }
+    return people;
 }
 
 
@@ -235,28 +390,26 @@ async function run({ dryRun = true } = {}) {
     logRunBoundary(dryRun ? '[DRY RUN] ADO OFFICE LOCATION RUN START' : 'ADO OFFICE LOCATION RUN START');
     await getOneLoginCustomAttributes();
 
-    const ados = await getActiveAdos();
-    const clinicIdsByAdoId = await buildHubspotClinicIdsByAdoId();
-    logger.info('Found active/on-leave ADOs', { count: ados.length });
+    const people = await getPeopleToSync();
+    logger.info('Found active/on-leave ADOs and Care Coordinators reporting to one', { count: people.length });
 
     const changed = [];
     const unchanged = [];
     const skippedNoUser = [];
 
-    for (const ado of ados) {
-        const hubspotClinicIds = clinicIdsByAdoId.get(ado.associateId) || [];
-        const officeLocationValue = buildOfficeLocationValue(ado.homeClinicId, hubspotClinicIds);
+    for (const person of people) {
+        const officeLocationValue = buildOfficeLocationValue(person.homeClinicId, person.hubspotClinicIds);
 
-        const oneLoginUser = await findOneLoginUserByAssociateId(ado.associateId);
+        const oneLoginUser = await findOneLoginUserByAssociateId(person.associateId);
         if (!oneLoginUser) {
-            logger.warn('No matching OneLogin user found for ADO', { associateId: ado.associateId, email: ado.email });
-            skippedNoUser.push({ fullName: ado.fullName, email: ado.email, associateId: ado.associateId });
+            logger.warn('No matching OneLogin user found', { associateId: person.associateId, email: person.email, role: person.role });
+            skippedNoUser.push({ fullName: person.fullName, email: person.email, associateId: person.associateId, role: person.role });
             continue;
         }
 
         const currentValue = (oneLoginUser.custom_attributes && oneLoginUser.custom_attributes.officelocation) || '';
         if (currentValue === officeLocationValue) {
-            unchanged.push({ fullName: ado.fullName, value: officeLocationValue });
+            unchanged.push({ fullName: person.fullName, role: person.role, value: officeLocationValue });
             continue;
         }
 
@@ -266,12 +419,12 @@ async function run({ dryRun = true } = {}) {
             await patchOfficeLocation(oneLoginUser.id, officeLocationValue);
         }
         changed.push({
-            fullName: ado.fullName, email: ado.email, oneLoginUserId: oneLoginUser.id,
+            fullName: person.fullName, email: person.email, role: person.role, oneLoginUserId: oneLoginUser.id,
             before: currentValue, after: officeLocationValue
         });
     }
 
-    logger.info('Consolidated ADO office location changes for this run', {
+    logger.info('Consolidated office location changes for this run', {
         date: new Date().toISOString(),
         dryRun,
         changed,
@@ -285,24 +438,52 @@ async function run({ dryRun = true } = {}) {
 }
 
 /*
-    Builds the validation CSV (ADO Name, Work Email, OneLogin Office Location
-    Value) so the combined home-location + HubSpot-clinic-names string can be
-    reviewed by eye before any of this goes to a real OneLogin write. Read-only -
-    no OneLogin PATCH/PUT involved.
+    Builds the validation CSV so the combined home-location + HubSpot-clinic
+    value can be reviewed by eye before any of this goes to a real OneLogin
+    write. Read-only - no OneLogin PATCH/PUT involved.
+
+    Includes every ADO (all synced), plus EVERY Care Coordinator regardless of
+    who they report to (not just the ones that qualify) - "Reports To ADO"
+    makes it clear which ones run() will actually sync vs. which are shown for
+    visibility only (their "OneLogin Office Location Value" for those is just
+    their own home location, since no ADO's clinics apply).
 */
 async function generateValidationReport() {
-    const ados = await getActiveAdos();
-    const clinicIdsByAdoId = await buildHubspotClinicIdsByAdoId();
-    logger.info('Found active/on-leave ADOs for validation report', { count: ados.length });
+    // forceRefresh: true - same reasoning as getPeopleToSync, always read
+    // current ADP + HubSpot data rather than a stale cache. One ADP pull,
+    // shared between ados/allCareCoordinators (see extractActiveAdos/
+    // extractAllActiveCareCoordinators) - not two separate fresh pulls.
+    const workers = await getAdpWorkers({ forceRefresh: true });
+    const ados = extractActiveAdos(workers);
+    const clinicIdsByAdoId = await buildHubspotClinicIdsByAdoId({ forceRefresh: true });
+    const adoAssociateIds = new Set(ados.map(a => a.associateId));
+    const allCareCoordinators = extractAllActiveCareCoordinators(workers);
+    logger.info('Found active/on-leave ADOs and Care Coordinators for validation report', {
+        adoCount: ados.length, careCoordinatorCount: allCareCoordinators.length
+    });
 
     const rows = [];
     for (const ado of ados) {
         const hubspotClinicIds = clinicIdsByAdoId.get(ado.associateId) || [];
-        const officeLocationValue = buildOfficeLocationValue(ado.homeClinicId, hubspotClinicIds);
         rows.push({
-            'ADO Name': ado.fullName,
+            'Name': ado.fullName,
+            'Role': 'ado',
             'Work Email': ado.email,
-            'OneLogin Office Location Value': officeLocationValue
+            'Manager Name': '',
+            'Reports To ADO': '',
+            'OneLogin Office Location Value': buildOfficeLocationValue(ado.homeClinicId, hubspotClinicIds)
+        });
+    }
+    for (const cc of allCareCoordinators) {
+        const reportsToAdo = adoAssociateIds.has(cc.managerAssociateId);
+        const hubspotClinicIds = reportsToAdo ? (clinicIdsByAdoId.get(cc.managerAssociateId) || []) : [];
+        rows.push({
+            'Name': cc.fullName,
+            'Role': 'carecoord',
+            'Work Email': cc.email,
+            'Manager Name': cc.managerFullName || '',
+            'Reports To ADO': reportsToAdo,
+            'OneLogin Office Location Value': buildOfficeLocationValue(cc.homeClinicId, hubspotClinicIds)
         });
     }
 
@@ -344,7 +525,12 @@ module.exports = {
     run,
     getOneLoginCustomAttributes,
     getAdpWorkers,
+    extractActiveAdos,
+    extractAllActiveCareCoordinators,
     getActiveAdos,
+    getAllActiveCareCoordinators,
+    getActiveCareCoordinatorsReportingToAdo,
+    getPeopleToSync,
     buildHubspotClinicIdsByAdoId,
     buildOfficeLocationValue,
     findOneLoginUserByAssociateId,
