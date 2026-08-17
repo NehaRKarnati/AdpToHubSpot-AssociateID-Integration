@@ -178,8 +178,8 @@ function sortWorkersIntoRoles(activeWorkers, terminatedWorkers) {
     Pass 1: for every colliding group, any record with a middleName gets its
     fullName rebuilt as "Given Middle Family" instead of "Given Family".
     Pass 2: anything STILL colliding after that (no middle name, or same
-    middle name too) gets "-<trailing digits of positionId>" appended
-    (e.g. "Elisa Morris-011446", from positionId "I4A011446").
+    middle name too) gets " - <trailing digits of positionId>" appended
+    (e.g. "Elisa Morris - 011446", from positionId "I4A011446").
 */
 function resolveDuplicateFullNames(records, context = 'unknown') {
     const resolved = records.map(record => ({ ...record }));
@@ -212,7 +212,7 @@ function resolveDuplicateFullNames(records, context = 'unknown') {
                 continue;
             }
             const before = record.fullName;
-            record.fullName = `${record.fullName}-${trailingDigits[1]}`;
+            record.fullName = `${record.fullName} - ${trailingDigits[1]}`;
             logger.warn('Duplicate name still colliding after adding middle name - appended positionId digits', {
                 context, before, after: record.fullName, associateId: record.associateId
             });

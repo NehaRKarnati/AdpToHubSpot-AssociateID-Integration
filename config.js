@@ -35,13 +35,23 @@ const ADP_STATUS = {
     delimited list of values (HubSpot checkbox/multi-select field), not one
     atomic value - ados_in_20_min_drive is the only one of these so far.
 */
+/*
+    ard/future_ado and rvp/future_rvp/regional_ops_coordinator/cd_iii
+    deliberately include roles beyond their "obvious" one (e.g. cd/cd3/dor in
+    ard) - the team wants every one of these dropdowns always fully populated
+    with all cross-eligible roles, not just resolved on-demand when someone's
+    manually pre-staged for a promotion/demotion. This means the daily sync
+    auto-creates/maintains a real option for every active person in every
+    listed role, not just a narrow "primary" set - e.g. ard/future_ado will
+    carry a real option for every current CD/CD3/DOR, not just ADOs/RVPs/ROCs.
+*/
 const LIST_DEFINITIONS = {
-    ard: { eligibleRoles: ['ado', 'rvp', 'roc'], associateIdField: 'ado_adp_id' },
-    future_ado: { eligibleRoles: ['ado', 'rvp', 'roc'], associateIdField: null },
+    ard: { eligibleRoles: ['ado', 'rvp', 'roc', 'cd', 'cd3', 'dor'], associateIdField: 'ado_adp_id' },
+    future_ado: { eligibleRoles: ['ado', 'rvp', 'roc', 'cd', 'cd3', 'dor'], associateIdField: null },
     ados_in_20_min_drive: { eligibleRoles: ['ado', 'rvp', 'roc'], associateIdField: null, multiSelect: true },
 
-    rvp: { eligibleRoles: ['rvp', 'roc', 'dvp'], associateIdField: 'rvp_adp_id' },
-    future_rvp: { eligibleRoles: ['rvp', 'roc', 'dvp'], associateIdField: null },
+    rvp: { eligibleRoles: ['rvp', 'roc', 'dvp', 'ado'], associateIdField: 'rvp_adp_id' },
+    future_rvp: { eligibleRoles: ['rvp', 'roc', 'dvp', 'ado'], associateIdField: null },
 
     dvp: { eligibleRoles: ['dvp'], associateIdField: 'dvp_adp_id' },
     future_dvp: { eligibleRoles: ['dvp'], associateIdField: null },
@@ -49,9 +59,9 @@ const LIST_DEFINITIONS = {
     team_lead: { eligibleRoles: ['cd', 'cd3', 'dor', 'ado'], associateIdField: 'cd_dor_adp_id' },
     future_team_lead: { eligibleRoles: ['cd', 'cd3', 'dor', 'ado'], associateIdField: null },
 
-    cd_iii: { eligibleRoles: ['cd3'], associateIdField: 'cdiii_adp_id' },
+    cd_iii: { eligibleRoles: ['cd3', 'ado'], associateIdField: 'cdiii_adp_id' },
 
-    regional_ops_coordinator: { eligibleRoles: ['roc'], associateIdField: 'roc_adp_id' },
+    regional_ops_coordinator: { eligibleRoles: ['roc', 'ado'], associateIdField: 'roc_adp_id' },
 
     ops_coordinator: { eligibleRoles: ['carecoord'], associateIdField: 'carecoord_adp_id' },
     future_ops_coordinator: { eligibleRoles: ['carecoord'], associateIdField: null }

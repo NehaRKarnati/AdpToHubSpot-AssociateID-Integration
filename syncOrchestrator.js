@@ -1,17 +1,37 @@
 const { getAllADPWorkers } = require('./adpWorkerFetch');
 const { buildAllDropdownLists } = require('./workerRoleFormatter');
-const { getCompaniesByPropertyValue } = require('./hubspotRead');
+const { getAllCompanies } = require('./hubspotRead');
 const { syncDropdownOptions, updateCompanyAdoFields } = require('./hubspotWrite');
 const { LIST_DEFINITIONS } = require('./config');
 const { logger, runStats, logRunBoundary } = require('./logger');
 const { sendSyncChangeNotification } = require('./notifier');
 
 /*
+    Groups one bulk company pull (see runSync) by a single-value dropdown
+    property's value, so every list's company lookup is a plain in-memory Map
+    read instead of a live search call per active person. Replaces what used
+    to be one getCompaniesByPropertyValue call per person per list - with the
+    lists having grown considerably (team_lead alone has 700+ active people),
+    that was hundreds of redundant search calls per run.
+*/
+function buildCompanyIndex(companies, propertyName) {
+    const index = new Map();
+    for (const company of companies) {
+        const value = company.properties[propertyName];
+        if (!value) continue;
+        if (!index.has(value)) index.set(value, []);
+        index.get(value).push(company);
+    }
+    return index;
+}
+
+/*
     Runs the full ADP -> HubSpot sync for one dropdown list (e.g. 'ard',
     'future_rvp', 'cd_iii'): reconciles the dropdown's options against this
     list's eligible-role records, then, for every active person in the list,
-    finds companies already pointing at their associate ID and rewrites the
-    dropdown value (and the paired ID field, if this list has one - see
+    finds companies already pointing at their associate ID (via the
+    pre-built companyIndex - see buildCompanyIndex) and rewrites the dropdown
+    value (and the paired ID field, if this list has one - see
     LIST_DEFINITIONS) to keep it correct.
 
     Pass dryRun: true to run the exact same logic and logging, but skip every
@@ -25,26 +45,17 @@ const { sendSyncChangeNotification } = require('./notifier');
     correct associate ID within a multi-select value is handled by
     migrateLegacyOptions.js (replaceMultiSelectToken), not the recurring sync.
 */
-async function syncList(listName, listRecords, associateIdField, multiSelect, dryRun = true) {
+async function syncList(listName, listRecords, associateIdField, multiSelect, companyIndex, dryRun = true) {
     const actions = await syncDropdownOptions(listName, listRecords.active, listRecords.terminated, dryRun);
     const taggedActions = actions.map(a => ({ ...a, list: listName }));
 
     if (multiSelect) return taggedActions;
 
     for (const record of listRecords.active) {
-        let companies;
-        try {
-            // Also pull the paired ID field (if this list has one) so we can
-            // check below whether it's already correct - the dropdown value
-            // itself is guaranteed correct already (that's literally the
-            // search filter), so the ID field is the only thing that could
-            // still need a PATCH.
-            companies = await getCompaniesByPropertyValue(listName, record.associateId, associateIdField ? [associateIdField] : []);
-        } catch (error) {
-            runStats.increment('errors');
-            runStats.addRecord({ ...record, list: listName, companyUpdateResult: 'search_failed', error: error.message });
-            continue;
-        }
+        // In-memory lookup now, not an API call - companyIndex already has
+        // every needed property (including associateIdField) from the one
+        // bulk pull in runSync.
+        const companies = companyIndex.get(record.associateId) || [];
 
         logger.info('Companies found for employee', {
             dropdown: listName,
@@ -87,13 +98,27 @@ async function syncList(listName, listRecords, associateIdField, multiSelect, dr
     return taggedActions;
 }
 
+// Every company property syncList needs across all 13 lists - exported so
+// main.js can build one combined property set (union with managePromotions's
+// own needs) for a single shared bulk company fetch.
+const SYNC_REQUIRED_PROPERTIES = new Set(['name']);
+for (const [listName, definition] of Object.entries(LIST_DEFINITIONS)) {
+    SYNC_REQUIRED_PROPERTIES.add(listName);
+    if (definition.associateIdField) SYNC_REQUIRED_PROPERTIES.add(definition.associateIdField);
+}
+
 /*
     Pass { dryRun: true } to replicate a full production run - same ADP pull,
     same classification, same per-list option/company logic and logging -
     without writing anything to HubSpot. Useful for a final end-to-end check
     before letting a run actually touch production.
+
+    Pass companies (already-fetched, with at least SYNC_REQUIRED_PROPERTIES on
+    each) to reuse a bulk fetch the caller already did - e.g. main.js fetches
+    once with the combined property set this and managePromotions both need,
+    instead of two separate full-portal fetches. Fetches its own otherwise.
 */
-async function runSync(numRecords = 99999, { dryRun = true } = {}) {
+async function runSync(numRecords = 99999, { dryRun = true, companies = null } = {}) {
     runStats.reset();
     logRunBoundary(dryRun ? '[DRY RUN] SYNC RUN START' : 'SYNC RUN START');
     logger.info(dryRun ? '[DRY RUN] Starting ADP -> HubSpot sync run - no writes will be made' : 'Starting ADP -> HubSpot sync run');
@@ -106,12 +131,18 @@ async function runSync(numRecords = 99999, { dryRun = true } = {}) {
 
     runStats.increment('adpRecordsProcessed', activeWorkers.length + terminatedWorkers.length);
 
+    // One bulk company pull for the whole run, instead of one search call per
+    // active person per list - see buildCompanyIndex.
+    const resolvedCompanies = companies || await getAllCompanies(Array.from(SYNC_REQUIRED_PROPERTIES));
+    logger.info('Fetched companies for sync run', { count: resolvedCompanies.length });
+
     const allActions = [];
     for (const [listName, definition] of Object.entries(LIST_DEFINITIONS)) {
         const listRecords = lists[listName];
         runStats.increment('activeRecordsProcessed', listRecords.active.length);
         runStats.increment('terminatedRecordsProcessed', listRecords.terminated.length);
-        const actions = await syncList(listName, listRecords, definition.associateIdField, definition.multiSelect, dryRun);
+        const companyIndex = definition.multiSelect ? null : buildCompanyIndex(resolvedCompanies, listName);
+        const actions = await syncList(listName, listRecords, definition.associateIdField, definition.multiSelect, companyIndex, dryRun);
         allActions.push(...actions);
     }
 
@@ -147,5 +178,6 @@ if (require.main === module) {
 
 module.exports = {
     runSync,
-    syncList
+    syncList,
+    SYNC_REQUIRED_PROPERTIES
 };
