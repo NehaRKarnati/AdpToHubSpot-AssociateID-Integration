@@ -3,14 +3,19 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { logger } = require('./logger');
 
+// Switched from O365/Exchange direct SMTP to Mandrill (Mailchimp
+// Transactional Email) - the old exchange_username/exchange_password
+// mailbox was disabled. host/Port/SMTP_Username/SMTP_Password are Mandrill's
+// SMTP credentials; exchange_destination is unrelated to auth (just the
+// "to" address) and is unaffected by this swap.
 const transporter = nodemailer.createTransport({
-    host: 'smtp.office365.com',
-    port: 587,
+    host: process.env.host,
+    port: Number(process.env.Port),
     secure: false,
     requireTLS: true,
     auth: {
-        user: process.env.exchange_username,
-        pass: process.env.exchange_password
+        user: process.env.SMTP_Username,
+        pass: process.env.SMTP_Password
     }
 });
 
