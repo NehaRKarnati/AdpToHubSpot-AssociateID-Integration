@@ -114,7 +114,7 @@ async function promoteEarlyStarts({ dryRun = true, companies = null } = {}) {
             resolveLabelCollision(optionsByValue, fullName, associateId);
             optionsByValue.set(associateId, { ...existing, label: fullName, value: associateId, hidden: false });
             anyNewOption = true;
-            results.push({ list: currentList, associateId, fullName, action: dryRun ? 'would_create' : 'created' });
+            results.push({ list: currentList, associateId, fullName, action: dryRun ? 'would_create_early' : 'created_early' });
 
             const trackingKey = `${currentList}:${associateId}`;
             if (!dryRun && !tracking[trackingKey]) {
@@ -126,7 +126,7 @@ async function promoteEarlyStarts({ dryRun = true, companies = null } = {}) {
 
         // Log only the ones actually being created here, not every due
         // candidate (some of dueAssociateIds may already be real options).
-        const newlyCreated = results.filter(r => r.list === currentList && (r.action === 'created' || r.action === 'would_create'));
+        const newlyCreated = results.filter(r => r.list === currentList && (r.action === 'created_early' || r.action === 'would_create_early'));
         if (dryRun) {
             logger.info(`${tag}Would create early-promotion option(s)`, { list: currentList, options: newlyCreated.map(r => ({ associateId: r.associateId, fullName: r.fullName })) });
         } else {
@@ -139,10 +139,40 @@ async function promoteEarlyStarts({ dryRun = true, companies = null } = {}) {
 
     if (!dryRun) await writeTracking(tracking);
     logger.info(`${tag}Finished early-promotion pass`, {
-        created: results.filter(r => r.action === 'created' || r.action === 'would_create').length,
+        created: results.filter(r => r.action === 'created_early' || r.action === 'would_create_early').length,
         alreadyExisted: results.filter(r => r.action === 'already_exists').length
     });
     return results;
+}
+
+/*
+    Every "list:associateId" pair currently within its 45-day grace period
+    (tracked by promoteEarlyStarts, not yet IDLE_DELETE_DAYS old) - these must
+    be protected from the regular sync's terminated-record cleanup
+    (syncDropdownOptions in hubspotWrite.js), which otherwise has no idea an
+    option was JUST created for someone ADP still shows as terminated (a
+    rehire whose ADP record won't flip to active until their real start
+    date). Without this, runSync would delete the option the very next day
+    (terminated + unreferenced), and promoteEarlyStarts would recreate it the
+    day after that - a daily create/delete loop, exactly like the Kelly
+    Zufall incident.
+
+    Returns a Set of "list:associateId" strings, matching tracking's own key
+    format - syncOrchestrator.js checks membership per list, not just by
+    associateId alone, so protection never accidentally leaks to a
+    different list this same person also happens to be in.
+*/
+async function getProtectedAssociateIds() {
+    const tracking = await readTracking();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const protectedKeys = new Set();
+    for (const [trackingKey, entry] of Object.entries(tracking)) {
+        const ageDays = daysBetween(today, new Date(entry.firstCreatedAt));
+        if (ageDays < IDLE_DELETE_DAYS) protectedKeys.add(trackingKey);
+    }
+    return protectedKeys;
 }
 
 /*
@@ -261,6 +291,7 @@ module.exports = {
     run,
     promoteEarlyStarts,
     cleanupIdlePromotions,
+    getProtectedAssociateIds,
     PROMOTION_LIST_MAP,
     PROMOTION_REQUIRED_PROPERTIES,
     EARLY_PROMOTION_WINDOW_DAYS,

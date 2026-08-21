@@ -2,9 +2,9 @@ const { getAllADPWorkers } = require('./adpWorkerFetch');
 const { buildAllDropdownLists } = require('./workerRoleFormatter');
 const { getAllCompanies } = require('./hubspotRead');
 const { syncDropdownOptions, updateCompanyAdoFields } = require('./hubspotWrite');
+const { getProtectedAssociateIds } = require('./managePromotions');
 const { LIST_DEFINITIONS } = require('./config');
 const { logger, runStats, logRunBoundary } = require('./logger');
-const { sendSyncChangeNotification } = require('./notifier');
 
 /*
     Groups one bulk company pull (see runSync) by a single-value dropdown
@@ -45,8 +45,8 @@ function buildCompanyIndex(companies, propertyName) {
     correct associate ID within a multi-select value is handled by
     migrateLegacyOptions.js (replaceMultiSelectToken), not the recurring sync.
 */
-async function syncList(listName, listRecords, associateIdField, multiSelect, companyIndex, dryRun = true) {
-    const actions = await syncDropdownOptions(listName, listRecords.active, listRecords.terminated, dryRun);
+async function syncList(listName, listRecords, associateIdField, multiSelect, companyIndex, protectedKeys, dryRun = true) {
+    const actions = await syncDropdownOptions(listName, listRecords.active, listRecords.terminated, dryRun, protectedKeys);
     const taggedActions = actions.map(a => ({ ...a, list: listName }));
 
     if (multiSelect) return taggedActions;
@@ -117,16 +117,18 @@ for (const [listName, definition] of Object.entries(LIST_DEFINITIONS)) {
     each) to reuse a bulk fetch the caller already did - e.g. main.js fetches
     once with the combined property set this and managePromotions both need,
     instead of two separate full-portal fetches. Fetches its own otherwise.
+
+    forceRefresh defaults to true - every production run pulls current ADP
+    data, never the getAllADPWorkers() disk cache. Pass forceRefresh: false
+    for a quick local test run (dry run + cached data combo) that skips the
+    full ADP pull entirely.
 */
-async function runSync(numRecords = 99999, { dryRun = true, companies = null } = {}) {
+async function runSync(numRecords = 99999, { dryRun = true, companies = null, forceRefresh = true } = {}) {
     runStats.reset();
     logRunBoundary(dryRun ? '[DRY RUN] SYNC RUN START' : 'SYNC RUN START');
     logger.info(dryRun ? '[DRY RUN] Starting ADP -> HubSpot sync run - no writes will be made' : 'Starting ADP -> HubSpot sync run');
 
-    // forceRefresh: true - every run pulls current ADP data, never the
-    // getAllADPWorkers() disk cache (that cache exists for ad-hoc/manual
-    // testing scripts only, not for this recurring production entry point).
-    const { activeWorkers, terminatedWorkers } = await getAllADPWorkers(numRecords, { forceRefresh: true });
+    const { activeWorkers, terminatedWorkers } = await getAllADPWorkers(numRecords, { forceRefresh });
     const lists = buildAllDropdownLists(activeWorkers, terminatedWorkers);
 
     runStats.increment('adpRecordsProcessed', activeWorkers.length + terminatedWorkers.length);
@@ -136,13 +138,19 @@ async function runSync(numRecords = 99999, { dryRun = true, companies = null } =
     const resolvedCompanies = companies || await getAllCompanies(Array.from(SYNC_REQUIRED_PROPERTIES));
     logger.info('Fetched companies for sync run', { count: resolvedCompanies.length });
 
+    // Anyone managePromotions early-created within the last 45 days (e.g. a
+    // rehire ADP still shows as terminated until their real start date) -
+    // syncDropdownOptions must never delete these via its terminated-cleanup,
+    // no matter what ADP currently says about them. See getProtectedAssociateIds.
+    const protectedKeys = await getProtectedAssociateIds();
+
     const allActions = [];
     for (const [listName, definition] of Object.entries(LIST_DEFINITIONS)) {
         const listRecords = lists[listName];
         runStats.increment('activeRecordsProcessed', listRecords.active.length);
         runStats.increment('terminatedRecordsProcessed', listRecords.terminated.length);
         const companyIndex = definition.multiSelect ? null : buildCompanyIndex(resolvedCompanies, listName);
-        const actions = await syncList(listName, listRecords, definition.associateIdField, definition.multiSelect, companyIndex, dryRun);
+        const actions = await syncList(listName, listRecords, definition.associateIdField, definition.multiSelect, companyIndex, protectedKeys, dryRun);
         allActions.push(...actions);
     }
 
@@ -165,9 +173,12 @@ async function runSync(numRecords = 99999, { dryRun = true, companies = null } =
     });
     logRunBoundary(dryRun ? '[DRY RUN] SYNC RUN END' : 'SYNC RUN END');
 
-    await sendSyncChangeNotification(notifiableActions, dryRun);
-
-    return summary;
+    // No email sent here anymore - main.js sends ONE consolidated email after
+    // migrateLegacyOptions and managePromotions have also run, so a reader
+    // sees the full picture (e.g. an option this step deleted that promotions
+    // then recreated later in the same run) instead of just this step's
+    // slice, which was actively misleading on its own.
+    return { summary, optionChanges: notifiableActions };
 }
 
 if (require.main === module) {

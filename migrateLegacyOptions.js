@@ -125,7 +125,7 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
             value: newAssociateId,
             hidden: false
         });
-        results.push({ list: listName, legacyValue: option.value, label: option.label, newAssociateId, action: 'option_created' });
+        results.push({ list: listName, legacyValue: option.value, label: option.label, newAssociateId, action: dryRun ? 'would_create_option' : 'option_created' });
         matchedOptions.push({ option, cleanLabel, newAssociateId });
     }
 
@@ -229,7 +229,7 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
 
             if (!stillInUse) {
                 optionsByValue.delete(legacyValue);
-                results.push({ list: listName, legacyValue, label, action: 'deleted' });
+                results.push({ list: listName, legacyValue, label, action: dryRun ? 'would_delete' : 'deleted' });
                 continue;
             }
 
@@ -249,7 +249,7 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
                 // label for - just rename+hide this option in place.
                 optionsByValue.set(legacyValue, { ...existing, label: renamedLabel, hidden: true });
             }
-            results.push({ list: listName, legacyValue, label: renamedLabel, action: 'renamed_and_hidden' });
+            results.push({ list: listName, legacyValue, label: renamedLabel, action: dryRun ? 'would_rename_and_hide' : 'renamed_and_hidden' });
         }
 
         if (dryRun) {
@@ -295,10 +295,10 @@ async function migrateLegacyOptions(numRecords = 99999, { dryRun = false } = {})
 
     logger.info(dryRun ? '[DRY RUN] Finished legacy options migration across all lists - nothing was written' : 'Finished legacy options migration across all lists', {
         totalActions: allResults.length,
-        optionsCreated: allResults.filter(r => r.action === 'option_created').length,
+        optionsCreated: allResults.filter(r => r.action === 'option_created' || r.action === 'would_create_option').length,
         reassigned: allResults.filter(r => r.action === 'reassigned' || r.action === 'would_reassign').length,
-        deleted: allResults.filter(r => r.action === 'deleted').length,
-        renamedAndHidden: allResults.filter(r => r.action === 'renamed_and_hidden').length,
+        deleted: allResults.filter(r => r.action === 'deleted' || r.action === 'would_delete').length,
+        renamedAndHidden: allResults.filter(r => r.action === 'renamed_and_hidden' || r.action === 'would_rename_and_hide').length,
         failed: allResults.filter(r => r.action === 'reassign_failed' || r.action === 'search_failed').length
     });
 
@@ -357,7 +357,7 @@ async function cleanupLegacyOptionsForList(listName, listRecords, multiSelect, d
 
         if (!stillInUse) {
             optionsByValue.delete(option.value);
-            results.push({ list: listName, legacyValue: option.value, label: option.label, action: 'deleted' });
+            results.push({ list: listName, legacyValue: option.value, label: option.label, action: dryRun ? 'would_delete' : 'deleted' });
             optionsChanged = true;
             continue;
         }
@@ -369,7 +369,7 @@ async function cleanupLegacyOptionsForList(listName, listRecords, multiSelect, d
             ? option.label
             : `${option.label}${LEGACY_LABEL_SUFFIX}`;
         optionsByValue.set(option.value, { ...option, label: renamedLabel, hidden: true });
-        results.push({ list: listName, legacyValue: option.value, label: renamedLabel, action: 'renamed_and_hidden' });
+        results.push({ list: listName, legacyValue: option.value, label: renamedLabel, action: dryRun ? 'would_rename_and_hide' : 'renamed_and_hidden' });
         optionsChanged = true;
     }
 

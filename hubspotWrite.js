@@ -51,9 +51,16 @@ function resolveLabelCollision(optionsByValue, label, valueToExclude) {
     Pass dryRun: true to compute and log every decision exactly as normal,
     but skip the final PATCH - nothing gets written to HubSpot.
 
+    protectedKeys: a Set of "propertyName:associateId" strings (see
+    managePromotions.js's getProtectedAssociateIds) that must be left
+    completely untouched here even if ADP currently shows them terminated -
+    a rehire early-created by managePromotions before their ADP record
+    flips to active on the real start date would otherwise get deleted by
+    this same terminated-cleanup the very next run.
+
     Returns per-option actions taken, for the run's detailed output.
 */
-async function syncDropdownOptions(propertyName, activeRecords, terminatedRecords, dryRun = false) {
+async function syncDropdownOptions(propertyName, activeRecords, terminatedRecords, dryRun = false, protectedKeys = new Set()) {
     const tag = dryRun ? '[DRY RUN] ' : '';
     const property = await getCompanyProperty(propertyName);
     const optionsByValue = new Map((property.options || []).map(opt => [opt.value, opt]));
@@ -69,7 +76,7 @@ async function syncDropdownOptions(propertyName, activeRecords, terminatedRecord
                 hidden: false,
                 displayOrder: -1
             });
-            actions.push({ associateId: record.associateId, fullName: record.fullName, action: 'created' });
+            actions.push({ associateId: record.associateId, fullName: record.fullName, action: dryRun ? 'would_create' : 'created' });
             runStats.increment('optionsCreated');
             logger.info(`${tag}Option created`, {
                 dropdown: propertyName, associateId: record.associateId, label: record.fullName
@@ -82,7 +89,7 @@ async function syncDropdownOptions(propertyName, activeRecords, terminatedRecord
         if (nameChanged || wasHidden) {
             resolveLabelCollision(optionsByValue, record.fullName, record.associateId);
             optionsByValue.set(record.associateId, { ...existing, label: record.fullName, hidden: false });
-            actions.push({ associateId: record.associateId, fullName: record.fullName, action: 'updated' });
+            actions.push({ associateId: record.associateId, fullName: record.fullName, action: dryRun ? 'would_update' : 'updated' });
             runStats.increment('optionsUpdated');
             logger.info(`${tag}Option updated`, {
                 dropdown: propertyName,
@@ -100,7 +107,14 @@ async function syncDropdownOptions(propertyName, activeRecords, terminatedRecord
 
     const terminatedCandidates = terminatedRecords.filter(record => {
         const existing = optionsByValue.get(record.associateId);
-        return existing && existing.hidden !== true;
+        if (!existing || existing.hidden === true) return false;
+        if (protectedKeys.has(`${propertyName}:${record.associateId}`)) {
+            logger.info(`${tag}Skipping terminated-cleanup for protected early-promotion/rehire option`, {
+                dropdown: propertyName, associateId: record.associateId, label: record.fullName
+            });
+            return false;
+        }
+        return true;
     });
 
     let valuesInUse = new Set();
@@ -121,14 +135,14 @@ async function syncDropdownOptions(propertyName, activeRecords, terminatedRecord
 
         if (stillInUse) {
             optionsByValue.set(record.associateId, { ...existing, hidden: true });
-            actions.push({ associateId: record.associateId, fullName: record.fullName, action: 'hidden' });
+            actions.push({ associateId: record.associateId, fullName: record.fullName, action: dryRun ? 'would_hide' : 'hidden' });
             runStats.increment('optionsHidden');
             logger.info(`${tag}Option hidden (terminated, still referenced by a company)`, {
                 dropdown: propertyName, associateId: record.associateId, label: record.fullName
             });
         } else {
             optionsByValue.delete(record.associateId);
-            actions.push({ associateId: record.associateId, fullName: record.fullName, action: 'deleted' });
+            actions.push({ associateId: record.associateId, fullName: record.fullName, action: dryRun ? 'would_delete' : 'deleted' });
             runStats.increment('optionsDeleted');
             logger.info(`${tag}Option deleted (terminated, unreferenced by any company)`, {
                 dropdown: propertyName, associateId: record.associateId, label: record.fullName
