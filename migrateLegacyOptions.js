@@ -111,21 +111,40 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
             continue;
         }
 
-        // Must happen before setting the new option below: the legacy option
-        // being replaced almost always has this exact label already (that's
-        // how the name match worked in the first place) - without renaming
-        // it out of the way here, the upcoming early PATCH would send two
-        // options with the same label in one request and HubSpot would
-        // reject the whole PATCH (NON_UNIQUE_OPTION_LABELS).
-        resolveLabelCollision(optionsByValue, cleanLabel, newAssociateId);
+        // If the replacement option was already created correctly on a prior
+        // run, skip re-creating/re-reporting it - otherwise a legacy option
+        // that can never actually be deleted (e.g. only referenced by a
+        // company missing clinic_id, so it's invisible to the reassignment
+        // search below and permanently stuck "still in use") would re-log
+        // "option_created" every single day forever, even though nothing
+        // about the real option has changed since the day it was made.
+        const existingReplacement = optionsByValue.get(newAssociateId);
+        const alreadyCorrect = existingReplacement
+            && existingReplacement.label === cleanLabel
+            && existingReplacement.hidden !== true;
 
-        optionsByValue.set(newAssociateId, {
-            ...optionsByValue.get(newAssociateId),
-            label: cleanLabel,
-            value: newAssociateId,
-            hidden: false
-        });
-        results.push({ list: listName, legacyValue: option.value, label: option.label, newAssociateId, action: dryRun ? 'would_create_option' : 'option_created' });
+        if (!alreadyCorrect) {
+            // Must happen before setting the new option below: the legacy option
+            // being replaced almost always has this exact label already (that's
+            // how the name match worked in the first place) - without renaming
+            // it out of the way here, the upcoming early PATCH would send two
+            // options with the same label in one request and HubSpot would
+            // reject the whole PATCH (NON_UNIQUE_OPTION_LABELS).
+            resolveLabelCollision(optionsByValue, cleanLabel, newAssociateId);
+
+            optionsByValue.set(newAssociateId, {
+                ...existingReplacement,
+                label: cleanLabel,
+                value: newAssociateId,
+                hidden: false
+            });
+            results.push({ list: listName, legacyValue: option.value, label: option.label, newAssociateId, action: dryRun ? 'would_create_option' : 'option_created' });
+        }
+
+        // Still attempt reassignment every run, regardless of alreadyCorrect -
+        // the replacement option existing doesn't mean every company still
+        // holding the legacy string value has actually been switched over yet
+        // (see the clinic_id gap above).
         matchedOptions.push({ option, cleanLabel, newAssociateId });
     }
 
@@ -233,10 +252,18 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
                 continue;
             }
 
+            const existing = optionsByValue.get(legacyValue);
+
+            // Already renamed+hidden from a prior run and nothing left to do
+            // for it - skip silently instead of re-reporting the same
+            // no-op "change" every single day it stays stuck in this
+            // still-referenced-so-can't-delete state. Same idempotency check
+            // cleanupLegacyOptionsForList already has, just missing here.
+            if (existing.label.endsWith(LEGACY_LABEL_SUFFIX) && existing.hidden === true) continue;
+
             logger.warn('Legacy option still referenced by a company - hiding instead of deleting', {
                 list: listName, label, value: legacyValue
             });
-            const existing = optionsByValue.get(legacyValue);
             const renamedLabel = existing.label.endsWith(LEGACY_LABEL_SUFFIX)
                 ? existing.label
                 : `${existing.label}${LEGACY_LABEL_SUFFIX}`;
