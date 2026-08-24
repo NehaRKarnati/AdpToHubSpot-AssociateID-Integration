@@ -2,6 +2,7 @@ const { getAllADPWorkers } = require('./adpWorkerFetch');
 const { buildAllDropdownLists } = require('./workerRoleFormatter');
 const { getCompanyProperty, getCompaniesByPropertyValue, getCompaniesContainingToken, getValuesInUse, hubspotClient } = require('./hubspotRead');
 const { updateCompanyAdoFields, replaceMultiSelectToken, resolveLabelCollision } = require('./hubspotWrite');
+const { getProtectedAssociateIds } = require('./managePromotions');
 const { LIST_DEFINITIONS } = require('./config');
 const { logger } = require('./logger');
 
@@ -73,7 +74,7 @@ const OPTION_CREATE_SETTLE_MS = 3000;
     replace that preserves the other selected names, instead of the EQ
     search + whole-value overwrite used for single-value lists.
 */
-async function migrateLegacyOptionsForList(listName, associateIdField, listRecords, multiSelect, dryRun = false) {
+async function migrateLegacyOptionsForList(listName, associateIdField, listRecords, multiSelect, dryRun = false, protectedKeys = new Set()) {
     const tag = dryRun ? '[DRY RUN] ' : '';
     const knownAssociateIds = new Set([
         ...listRecords.active.map(r => r.associateId),
@@ -84,7 +85,19 @@ async function migrateLegacyOptionsForList(listName, associateIdField, listRecor
 
     const property = await getCompanyProperty(listName);
     const allOptions = property.options || [];
-    const legacyOptions = allOptions.filter(opt => !knownAssociateIds.has(opt.value) && !PROTECTED_OPTION_VALUES.has(opt.value));
+    // "Legacy" here just means "not in today's ADP-eligible set for this
+    // list" - that's NOT the same as "actually a stale name-string value".
+    // A manually-staged early-promotion/rehire option (see managePromotions.js)
+    // can be a real, already-correct associateId-keyed option that simply
+    // isn't role-eligible in ADP yet (e.g. Kelly Zufall, a COTA manually
+    // staged into team_lead) - without this protectedKeys exclusion, this
+    // loop would treat it as legacy and rename+hide or delete it, exactly
+    // like it's not supposed to (see getProtectedAssociateIds).
+    const legacyOptions = allOptions.filter(opt =>
+        !knownAssociateIds.has(opt.value)
+        && !PROTECTED_OPTION_VALUES.has(opt.value)
+        && !protectedKeys.has(`${listName}:${opt.value}`)
+    );
 
     logger.info('Found legacy options for list', { list: listName, count: legacyOptions.length });
     if (legacyOptions.length === 0) return { results: [], finalOptions: allOptions };
@@ -314,9 +327,15 @@ async function migrateLegacyOptions(numRecords = 99999, { dryRun = false } = {})
     const { activeWorkers, terminatedWorkers } = await getAllADPWorkers(numRecords);
     const lists = buildAllDropdownLists(activeWorkers, terminatedWorkers);
 
+    // Same protection managePromotions.js's tracking gives syncDropdownOptions -
+    // anyone manually staged early into a current list must be left alone by
+    // migration too, regardless of ADP role eligibility. See the comment on
+    // legacyOptions inside migrateLegacyOptionsForList for why this matters.
+    const protectedKeys = await getProtectedAssociateIds();
+
     const allResults = [];
     for (const [listName, definition] of Object.entries(LIST_DEFINITIONS)) {
-        const { results } = await migrateLegacyOptionsForList(listName, definition.associateIdField, lists[listName], definition.multiSelect, dryRun);
+        const { results } = await migrateLegacyOptionsForList(listName, definition.associateIdField, lists[listName], definition.multiSelect, dryRun, protectedKeys);
         allResults.push(...results);
     }
 
@@ -345,7 +364,7 @@ async function migrateLegacyOptions(numRecords = 99999, { dryRun = false } = {})
     since a company's field can be manually reselected at any time, quietly
     freeing up a legacy value that was still in use before.
 */
-async function cleanupLegacyOptionsForList(listName, listRecords, multiSelect, dryRun = false) {
+async function cleanupLegacyOptionsForList(listName, listRecords, multiSelect, dryRun = false, protectedKeys = new Set()) {
     const tag = dryRun ? '[DRY RUN] ' : '';
     const knownAssociateIds = new Set([
         ...listRecords.active.map(r => r.associateId),
@@ -354,7 +373,14 @@ async function cleanupLegacyOptionsForList(listName, listRecords, multiSelect, d
 
     const property = await getCompanyProperty(listName);
     const allOptions = property.options || [];
-    const legacyOptions = allOptions.filter(opt => !knownAssociateIds.has(opt.value) && !PROTECTED_OPTION_VALUES.has(opt.value));
+    // See the matching comment in migrateLegacyOptionsForList - a manually
+    // staged early-promotion/rehire option must never be treated as legacy
+    // just because it's not ADP-role-eligible yet.
+    const legacyOptions = allOptions.filter(opt =>
+        !knownAssociateIds.has(opt.value)
+        && !PROTECTED_OPTION_VALUES.has(opt.value)
+        && !protectedKeys.has(`${listName}:${opt.value}`)
+    );
 
     if (legacyOptions.length === 0) return [];
 
@@ -434,10 +460,11 @@ async function cleanupLegacyOptions(numRecords = 99999, { dryRun = false } = {})
 
     const { activeWorkers, terminatedWorkers } = await getAllADPWorkers(numRecords);
     const lists = buildAllDropdownLists(activeWorkers, terminatedWorkers);
+    const protectedKeys = await getProtectedAssociateIds();
 
     const allResults = [];
     for (const [listName, definition] of Object.entries(LIST_DEFINITIONS)) {
-        const results = await cleanupLegacyOptionsForList(listName, lists[listName], definition.multiSelect, dryRun);
+        const results = await cleanupLegacyOptionsForList(listName, lists[listName], definition.multiSelect, dryRun, protectedKeys);
         allResults.push(...results);
     }
 
