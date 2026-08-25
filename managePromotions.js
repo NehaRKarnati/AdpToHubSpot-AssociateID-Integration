@@ -105,12 +105,26 @@ async function promoteEarlyStarts({ dryRun = true, companies = null } = {}) {
         let anyNewOption = false;
         for (const associateId of dueAssociateIds) {
             const existing = optionsByValue.get(associateId);
+            const fullName = futureLabelByValue.get(associateId) || existing?.label || associateId;
+
+            // Protect the FUTURE-list option too, for everyone currently
+            // staged here - not just brand-new current-list creations. Both
+            // the current-list option and the future-list option it came
+            // from need to survive migrateLegacyOptions/syncDropdownOptions
+            // regardless of ADP role eligibility - tracking only the
+            // current-list side left the future-list option exposed (it's
+            // what migrateLegacyOptions reads to look up a name, and losing
+            // it breaks that lookup for as long as this promotion stays staged).
+            const futureTrackingKey = `${futureList}:${associateId}`;
+            if (!dryRun && !tracking[futureTrackingKey]) {
+                tracking[futureTrackingKey] = { fullName, firstCreatedAt: today.toISOString() };
+            }
+
             if (existing && existing.hidden !== true) {
                 results.push({ list: currentList, associateId, action: 'already_exists' });
                 continue;
             }
 
-            const fullName = futureLabelByValue.get(associateId) || associateId;
             resolveLabelCollision(optionsByValue, fullName, associateId);
             optionsByValue.set(associateId, { ...existing, label: fullName, value: associateId, hidden: false });
             anyNewOption = true;
